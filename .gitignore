@@ -1,0 +1,22 @@
+# Environment variables — contains real credentials
+.env
+
+# Virtual environment
+secureagent-env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Temp files
+*.tmp
+*.log
+
+# VS Code settings
+.vscode/
+
+# Windows system files
+Thumbs.db
+desktop.ini
