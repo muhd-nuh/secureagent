@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import requests as http_requests
 from agent.analyzer import build_gemini_prompt, call_gemini, validate_fix
 from agent.sandbox import deploy_sandbox
+from agent.attacker import run_attack, deploy_fix_and_verify
 
 load_dotenv()
 
@@ -58,10 +59,10 @@ def fetch_file_contents(gitlab_project_id, file_paths, branch):
                 file_contents[filename] = response.text
                 print(f"Fetched: {filename}")
             else:
-                print(f"Warning: could not fetch {filepath} — status {response.status_code}, skipping")
+                print(f"Warning: could not fetch {filepath}, status {response.status_code}, skipping")
 
         except Exception as e:
-            print(f"Warning: error fetching {filepath} — {e}, skipping")
+            print(f"Warning: error fetching {filepath}, {e}, skipping")
 
     return file_contents
 
@@ -93,7 +94,7 @@ def webhook():
     payload = request.get_json()
 
     if payload.get("object_kind") != "merge_request":
-        return jsonify({"message": "Ignored — not an MR event"}), 200
+        return jsonify({"message": "Ignored, not an MR event"}), 200
 
     thread = threading.Thread(target=process_pipeline, args=(payload,))
     thread.start()
@@ -103,8 +104,8 @@ def webhook():
 
 def process_pipeline(payload):
     """
-    Main SecureAgent pipeline — runs in background thread.
-    Stages: fetch files → analyse → validate → deploy sandbox → attack → fix → report
+    Main SecureAgent pipeline runs in background thread.
+    Flow: fetch files → analyse → validate → deploy sandbox → attack → fix → report
     """
     mr_iid = payload["object_attributes"]["iid"]
     branch = payload["object_attributes"]["source_branch"]
@@ -114,7 +115,7 @@ def process_pipeline(payload):
     # Only process MRs that are opened or updated with new commits
     action = payload["object_attributes"].get("action")
     if action not in ["open", "update"]:
-        print(f"Ignored — MR action: {action}")
+        print(f"Ignored - MR action: {action}")
         return
 
     # Step 1: Get changed files
@@ -128,17 +129,17 @@ def process_pipeline(payload):
     ]
 
     if not supported_files:
-        print("No supported files — pipeline stopped")
+        print("No supported files, pipeline stopped")
         return
 
     # Step 3: Fetch file contents from GitLab
     file_contents = fetch_file_contents(gitlab_project_id, supported_files, branch)
 
     if not file_contents:
-        print("No file contents retrieved — pipeline stopped")
+        print("No file contents retrieved, pipeline stopped")
         return
 
-    print(f"MR #{mr_iid} — files to scan: {list(file_contents.keys())}")
+    print(f"MR #{mr_iid} - files to scan: {list(file_contents.keys())}")
 
     # Step 4: Gemini security analysis
     try:
@@ -155,25 +156,42 @@ def process_pipeline(payload):
         post_mr_comment(gitlab_project_id, mr_iid, ":green_circle: **SecureAgent:** No vulnerabilities found. Your code is clean.")
         return
 
-    # Step 6: Vulnerabilities found — notify developer and begin sandbox process
+    # Step 6: Vulnerabilities found, notify developer and begin verification
     post_mr_comment(gitlab_project_id, mr_iid, ":yellow_circle: **SecureAgent:** Potential vulnerability found. Building sandbox...")
 
     for finding in report.findings:
         is_valid, reason = validate_fix(finding)
-        print(f"Fix validation — {finding.vulnerability}: {is_valid} — {reason}")
+        print(f"Fix validation, {finding.vulnerability}: {is_valid}, {reason}")
 
         if not is_valid:
-            print(f"Fix rejected: {reason} — flagging for manual review")
-            post_mr_comment(gitlab_project_id, mr_iid, f":red_circle: **SecureAgent:** Fix validation failed for {finding.vulnerability} — {reason}. Manual review required.")
+            print(f"Fix rejected: {reason}, flagging for manual review")
+            post_mr_comment(gitlab_project_id, mr_iid, f":red_circle: **SecureAgent:** Fix validation failed for {finding.vulnerability}, {reason}. Manual review required.")
             continue
 
-        # Step 7: Deploy sandbox (Stage 4)
         try:
+            # Step 7: Deploy sandbox with vulnerable code
             sandbox_url = deploy_sandbox(finding, gcp_project_id, mr_iid)
             print(f"Sandbox URL: {sandbox_url}")
+
+            # Step 8: Run attack against vulnerable sandbox, capture before proof
+            before_proof = run_attack(sandbox_url, finding)
+
+            if not before_proof["attack_succeeded"]:
+                print("Attack did not succeed, vulnerability may not be exploitable in sandbox")
+                post_mr_comment(gitlab_project_id, mr_iid, ":yellow_circle: **SecureAgent:** Vulnerability detected in code analysis but could not be proven in sandbox. Manual review recommended.")
+                continue
+
+            print("Attack succeeded before proof captured")
+
+            # Step 9: Deploy fix and verify it blocks the attack, capture after proof
+            after_proof = deploy_fix_and_verify(finding, gcp_project_id, mr_iid)
+
+            print(f"Before proof: {before_proof}")
+            print(f"After proof: {after_proof}")
+
         except Exception as e:
-            print(f"Sandbox deployment failed: {e}")
-            post_mr_comment(gitlab_project_id, mr_iid, f":red_circle: **SecureAgent:** Sandbox deployment failed. Manual review required.")
+            print(f"Pipeline error: {e}")
+            post_mr_comment(gitlab_project_id, mr_iid, ":red_circle: **SecureAgent:** Pipeline error during sandbox verification. Manual review required.")
             continue
 
 

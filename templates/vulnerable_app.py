@@ -17,7 +17,16 @@ def get_db():
     return conn
 
 
-# VULNERABLE_CODE_PLACEHOLDER
+def login(username, password):
+    conn = get_db()
+    cursor = conn.cursor()
+    # VULNERABLE_CODE_PLACEHOLDER
+    try:
+        cursor.execute(query)
+        result = cursor.fetchone()
+        return result
+    except Exception as e:
+        return None
 
 
 @app.route("/test", methods=["POST"])

@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Use .cmd extension on Windows — gcloud is a shell script on Linux/Mac
+# Use .cmd extension on Windows, gcloud is a shell script on Linux/Mac
 GCLOUD_CMD = "gcloud.cmd" if platform.system() == "Windows" else "gcloud"
 
 
@@ -16,28 +16,31 @@ def inject_vulnerable_code(vulnerable_code: str) -> str:
     """
     Creates a temporary working directory with the harness template
     and injects the developer's actual vulnerable code in place of the placeholder.
-    Returns the path to the temp directory ready for Docker build.
+    Returns the temp directory path ready for Docker build.
     """
     temp_dir = tempfile.mkdtemp()
     templates_dir = os.path.join(os.path.dirname(__file__), '..', 'templates')
 
-    # Copy Dockerfile into temp dir
+    # Copy Dockerfile into temp dir alongside the modified template
     shutil.copy(os.path.join(templates_dir, 'Dockerfile'), temp_dir)
 
-    # Read the harness template and inject vulnerable code
+    # Read harness template
     template_path = os.path.join(templates_dir, 'vulnerable_app.py')
     with open(template_path, 'r') as f:
         template_content = f.read()
 
+    # Strip leading whitespace from Gemini's output before injecting
+    # to ensure correct indentation inside the login function
+    cleaned_code = vulnerable_code.strip()
     injected_content = template_content.replace(
-        "# VULNERABLE_CODE_PLACEHOLDER",
-        vulnerable_code
+        "    # VULNERABLE_CODE_PLACEHOLDER",
+        f"    {cleaned_code}"
     )
 
     with open(os.path.join(temp_dir, 'vulnerable_app.py'), 'w') as f:
         f.write(injected_content)
 
-    print(f"Vulnerable code injected — temp dir: {temp_dir}")
+    print(f"Vulnerable code injected, temp dir: {temp_dir}")
     return temp_dir
 
 
@@ -76,8 +79,8 @@ def build_and_push_image(temp_dir: str, image_tag: str, project_id: str) -> str:
 
 def deploy_to_cloud_run(image_uri: str, service_name: str, project_id: str) -> str:
     """
-    Deploys the sandbox image to Cloud Run.
-    Each sandbox gets a unique service name based on the MR ID to avoid conflicts.
+    Deploys the sandbox image to Cloud Run as an ephemeral test environment.
+    Each sandbox uses a unique service name based on MR ID to avoid conflicts.
     Returns the live sandbox URL.
     """
     print(f"Deploying sandbox to Cloud Run: {service_name}")
@@ -100,7 +103,7 @@ def deploy_to_cloud_run(image_uri: str, service_name: str, project_id: str) -> s
     if deploy_result.returncode != 0:
         raise Exception(f"Cloud Run deploy failed: {deploy_result.stderr}")
 
-    # gcloud outputs the service URL to stderr, not stdout
+    # gcloud sends the service URL to stderr, not stdout
     for line in deploy_result.stderr.split("\n"):
         if "https://" in line and "Service URL:" in line:
             url = line.strip().split("Service URL: ")[-1]
@@ -112,8 +115,9 @@ def deploy_to_cloud_run(image_uri: str, service_name: str, project_id: str) -> s
 
 def deploy_sandbox(finding, project_id: str, mr_iid: str) -> str:
     """
-    Orchestrates the full sandbox deployment flow for a single finding.
-    project_id here is the GCP project ID passed from main.py.
+    Orchestrates the full sandbox deployment for a single finding.
+    Injects vulnerable code, builds image, pushes to GCR, deploys to Cloud Run.
+    project_id is the GCP project ID, not the GitLab project ID.
     Returns the sandbox URL once live.
     """
     service_name = f"secureagent-sandbox-mr{mr_iid}"
@@ -125,11 +129,13 @@ def deploy_sandbox(finding, project_id: str, mr_iid: str) -> str:
         image_uri = build_and_push_image(temp_dir, image_tag, project_id)
         sandbox_url = deploy_to_cloud_run(image_uri, service_name, project_id)
 
+        # Brief wait to ensure the service is fully ready before attacks begin
         print("Waiting for sandbox to warm up...")
         time.sleep(10)
 
         return sandbox_url
 
     finally:
+        # Always clean up temp dir regardless of success or failure
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
