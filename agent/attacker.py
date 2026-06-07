@@ -1,8 +1,11 @@
+import os
 import requests
+from google import genai
+from google.genai import types
 from agent.sandbox import deploy_sandbox
 
-# Response signals that confirm an attack succeeded.
-# We check the response body for these strings after firing the payload.
+# Response signals that confirm a successful attack in the sandbox response body.
+# Both body content and HTTP status are checked — see run_attack for full logic.
 ATTACK_SUCCESS_SIGNALS = {
     "SQL Injection": [
         "welcome admin", "sqlerror", "syntax error",
@@ -13,11 +16,17 @@ ATTACK_SUCCESS_SIGNALS = {
     ]
 }
 
+# Signals that indicate the attack was blocked — used as fallback detection.
+ATTACK_FAILURE_SIGNALS = ["invalid credentials", "failed", "unauthorized", "error"]
+
+MAX_RETRIES = 3
+
 
 def run_attack(sandbox_url: str, finding) -> dict:
     """
     Fires the attack payload against the sandbox /test endpoint.
-    Injects the payload into the target field Gemini identified.
+    Injects the payload into the exact field Gemini identified as vulnerable.
+    Uses two-layer detection: known success signals + HTTP status fallback.
     Returns a proof dict with status code, response body, and success flag.
     """
     target_url = f"{sandbox_url}/test"
@@ -31,9 +40,14 @@ def run_attack(sandbox_url: str, finding) -> dict:
     try:
         response = requests.post(target_url, data=post_data, timeout=10)
 
-        # Check response body for known attack success indicators
+        # Primary check: known success signals in response body
         signals = ATTACK_SUCCESS_SIGNALS.get(finding.vulnerability, [])
-        attack_succeeded = any(signal in response.text.lower() for signal in signals)
+        body_match = any(signal in response.text.lower() for signal in signals)
+
+        # Fallback: HTTP 200 with no failure signals also counts as attack succeeded
+        # Handles sandboxes where response wording doesn't match known signals
+        body_failure = any(signal in response.text.lower() for signal in ATTACK_FAILURE_SIGNALS)
+        attack_succeeded = body_match or (response.status_code == 200 and not body_failure)
 
         print(f"Attack result, succeeded: {attack_succeeded}, status: {response.status_code}")
 
@@ -59,16 +73,17 @@ def run_attack(sandbox_url: str, finding) -> dict:
 def deploy_fix_and_verify(finding, gcp_project_id: str, mr_iid: str) -> dict:
     """
     Deploys Gemini's fixed code to the sandbox and re-runs the same attack.
-    If the attack is blocked this time, the fix is verified.
+    Uses fixed_sandbox_template for dynamic fix verification if available.
     Returns after proof dict, same structure as run_attack output.
     """
-    # Wrap fixed_code in a minimal object so deploy_sandbox can use it
-    # deploy_sandbox expects a finding-like object with a vulnerable_code field
+    # Wrap fixed_code in a minimal object so deploy_sandbox can use it.
+    # deploy_sandbox expects a finding-like object with a vulnerable_code field.
     class FixedFinding:
         vulnerable_code = finding.fixed_code
         attack_payload = finding.attack_payload
         attack_field = finding.attack_field
         vulnerability = finding.vulnerability
+        sandbox_template = getattr(finding, 'fixed_sandbox_template', None)
 
     print("Deploying fixed code to sandbox...")
     fixed_sandbox_url = deploy_sandbox(FixedFinding(), gcp_project_id, mr_iid)
@@ -82,3 +97,83 @@ def deploy_fix_and_verify(finding, gcp_project_id: str, mr_iid: str) -> dict:
         print("Fix did not block attack, retry needed")
 
     return after_proof
+
+
+def get_improved_fix(finding, failed_proof: dict):
+    """
+    Asks Gemini to generate an improved fix using the failed attempt as context.
+    Passes the exact payload and server response so Gemini understands what bypassed the fix.
+    Returns a finding-like object with the improved fix, or None on failure.
+    """
+    retry_prompt = (
+        f"Your previous fix attempt for a {finding.vulnerability} vulnerability failed.\n\n"
+        f"Previous fix code:\n{finding.fixed_code}\n\n"
+        f"Attack payload that bypassed the fix:\n{failed_proof['payload_used']}\n\n"
+        f"Server response showing the fix was bypassed:\n{failed_proof['response_body']}\n\n"
+        "Analyze why your previous fix was bypassed by this specific attack and generate "
+        "an improved, completely secure replacement for the vulnerable line only. "
+        "Return ONLY the secure replacement line, no function definitions, "
+        "no inline comments, no markdown formatting."
+    )
+
+    try:
+        client = genai.Client(
+            vertexai=True,
+            project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+            location=os.getenv("GOOGLE_CLOUD_LOCATION")
+        )
+
+        response = client.models.generate_content(
+            model='gemini-3.5-flash',
+            contents=retry_prompt,
+            config=types.GenerateContentConfig(temperature=0.1),
+        )
+
+        improved_code = response.text.strip()
+        print(f"Improved fix from Gemini: {improved_code}")
+
+        # Wrap improved code in a finding-like object for deploy_sandbox compatibility
+        class ImprovedFinding:
+            vulnerable_code = improved_code
+            fixed_code = improved_code
+            attack_payload = finding.attack_payload
+            attack_field = finding.attack_field
+            vulnerability = finding.vulnerability
+
+        return ImprovedFinding()
+
+    except Exception as e:
+        print(f"Failed to get improved fix from Gemini: {e}")
+        return None
+
+
+def iterative_fix_loop(finding, before_proof: dict, gcp_project_id: str, mr_iid: str) -> tuple:
+    """
+    Attempts to verify the fix up to MAX_RETRIES times.
+    On each failed attempt, sends the failure context back to Gemini for an improved fix.
+    Stops early as soon as the fix is verified successfully.
+    Returns (final_after_proof, attempts_used, requires_manual_review).
+    """
+    current_finding = finding
+    after_proof = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f"Fix attempt {attempt} of {MAX_RETRIES}...")
+
+        after_proof = deploy_fix_and_verify(current_finding, gcp_project_id, mr_iid)
+
+        if not after_proof["attack_succeeded"]:
+            print(f"Fix verified on attempt {attempt}")
+            return after_proof, attempt, False
+
+        # Fix didn't work, request improved fix from Gemini with failure context
+        print(f"Attempt {attempt} failed, requesting improved fix from Gemini...")
+        improved_finding = get_improved_fix(current_finding, after_proof)
+
+        if improved_finding is None:
+            break
+
+        current_finding = improved_finding
+
+    print(f"All {MAX_RETRIES} attempts exhausted, flagging for manual review")
+    return after_proof, MAX_RETRIES, True
