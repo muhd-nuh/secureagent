@@ -1,0 +1,6 @@
+secureagent-env/
+__pycache__/
+*.pyc
+.env
+.git/
+test_mcp.py

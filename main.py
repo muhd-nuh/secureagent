@@ -116,6 +116,9 @@ def post_mr_comment(gitlab_project_id, mr_iid, message):
     else:
         logger.error(f"Failed to post comment: {response.status_code}")
 
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "SecureAgent", "version": "1.0.0"}), 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():

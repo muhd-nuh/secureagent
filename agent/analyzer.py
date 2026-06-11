@@ -6,12 +6,13 @@ from google.genai import types
 from pydantic import BaseModel, Field
 from typing import List
 from dotenv import load_dotenv
-from agent.logger import get_logger
-logger = get_logger("analyzer")
-from agent.secrets import get_secret
 
 load_dotenv()
 
+logger = get_logger("analyzer")
+
+from agent.logger import get_logger
+from agent.secrets import get_secret
 
 # Structured data models for Gemini's security analysis output.
 # Pydantic enforces the schema at the engine level, no manual JSON parsing needed.
@@ -125,6 +126,10 @@ def build_gemini_prompt(file_contents: dict) -> str:
         "- why_fix_works: Explain technically why the fix prevents the attack\n"
         "- developer_lesson: One sentence the developer should remember to avoid this class of vulnerability in future\n"
         "- If no vulnerabilities found, return an empty findings array\n"
+        "- IMPORTANT: You MUST flag ALL instances of string concatenation in SQL queries as SQL Injection, "
+        "regardless of how simple or short the function is\n"
+        "- Do not skip findings because the function lacks surrounding context or seems incomplete\n"
+        "- Every file must be scanned independently — do not skip any file\n"
     )
 
     prompt += (
@@ -139,7 +144,8 @@ def build_gemini_prompt(file_contents: dict) -> str:
         "- The /test endpoint must use request.form.get() to read POST fields\n"
         "- Use the same field name as attack_field in the /test endpoint\n"
         "- The app must return exactly {\"status\": \"success\", \"message\": \"Welcome admin\"} when attack succeeds\n"
-        "- The app must return exactly {\"status\": \"failed\", \"message\": \"Invalid credentials\"} when attack fails\n"
+        "- The app must return HTTP 401 with {\"status\": \"failed\", \"message\": \"Invalid credentials\"} when attack fails\n"
+        "- Use return jsonify({\"status\": \"failed\", \"message\": \"Invalid credentials\"}), 401 for failed attempts\n"
         "- App must start on PORT environment variable defaulting to 8080\n"
         "- Do not include any markdown formatting or code fences in the template\n"
         "- The template must be valid Python that runs without modification\n"
@@ -164,7 +170,7 @@ def call_gemini(prompt: str) -> SecurityReport:
     """
     client = genai.Client(
         vertexai=True,
-        project=get_secret("GOOGLE_CLOUD_PROJECT") if os.getenv("GOOGLE_CLOUD_PROJECT") else os.getenv("GOOGLE_CLOUD_PROJECT"),
+        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
         location=get_secret("GOOGLE_CLOUD_LOCATION"),
     )
 

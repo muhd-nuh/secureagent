@@ -19,8 +19,14 @@ GitPython==3.1.50
 google-adk==2.1.0
 google-api-core==2.31.0
 google-auth==2.53.0
+google-cloud-build==3.37.0
+google-cloud-core==2.6.0
+google-cloud-run==0.16.0
 google-cloud-secret-manager==2.29.0
+google-cloud-storage==3.11.0
+google-crc32c==1.8.0
 google-genai==1.75.0
+google-resumable-media==2.10.0
 googleapis-common-protos==1.75.0
 graphviz==0.21
 grpc-google-iam-v1==0.14.4
@@ -55,7 +61,6 @@ PyJWT==2.13.0
 pyOpenSSL==26.2.0
 python-dotenv==1.2.2
 python-multipart==0.0.29
-pywin32==312
 PyYAML==6.0.3
 referencing==0.37.0
 requests==2.34.2

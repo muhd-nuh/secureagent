@@ -4,6 +4,7 @@ from google import genai
 from google.genai import types
 from agent.sandbox import deploy_sandbox
 from agent.logger import get_logger
+from agent.secrets import get_secret
 
 logger = get_logger("attacker")
 
@@ -120,7 +121,7 @@ def get_improved_fix(finding, failed_proof: dict):
         client = genai.Client(
             vertexai=True,
             project=os.getenv("GOOGLE_CLOUD_PROJECT"),
-            location=os.getenv("GOOGLE_CLOUD_LOCATION")
+            location=get_secret("GOOGLE_CLOUD_LOCATION")
         )
 
         response = client.models.generate_content(

@@ -14,6 +14,7 @@ logger = get_logger("sandbox")
 
 # Use .cmd extension on Windows, gcloud is a shell script on Linux/Mac
 GCLOUD_CMD = "gcloud.cmd" if platform.system() == "Windows" else "gcloud"
+IS_WINDOWS = platform.system() == "Windows"
 
 
 def inject_vulnerable_code(vulnerable_code: str, sandbox_template: str = None, attack_field: str = "username") -> str:
@@ -59,10 +60,10 @@ def inject_vulnerable_code(vulnerable_code: str, sandbox_template: str = None, a
     return temp_dir
 
 
-def build_and_push_image(temp_dir: str, image_tag: str, project_id: str) -> str:
+def _build_with_docker(temp_dir: str, image_tag: str, project_id: str) -> str:
     """
-    Builds a Docker image from the temp directory and pushes it to
-    Google Container Registry. Returns the full image URI.
+    Builds and pushes sandbox image using local Docker.
+    Used on Windows/local development.
     """
     image_uri = f"gcr.io/{project_id}/secureagent-sandbox:{image_tag}"
 
@@ -92,12 +93,85 @@ def build_and_push_image(temp_dir: str, image_tag: str, project_id: str) -> str:
     return image_uri
 
 
-def deploy_to_cloud_run(image_uri: str, service_name: str, project_id: str) -> str:
+def _build_with_cloud_build(temp_dir: str, image_tag: str, project_id: str) -> str:
     """
-    Deploys the sandbox image to Cloud Run as an ephemeral test environment.
-    Each sandbox uses a unique service name based on MR ID to avoid conflicts.
-    gcloud outputs the service URL to stderr, not stdout, so we parse stderr.
-    Returns the live sandbox URL.
+    Builds and pushes sandbox image using Google Cloud Build API.
+    Used on Cloud Run — no local Docker needed.
+    """
+    import tarfile
+    import uuid
+    from google.cloud import storage
+    from google.cloud.devtools import cloudbuild
+
+    image_uri = f"gcr.io/{project_id}/secureagent-sandbox:{image_tag}"
+    bucket_name = f"{project_id}-secureagent-builds"
+    blob_name = f"source-{uuid.uuid4()}.tar.gz"
+
+    # Create tar archive of temp_dir
+    tar_path = f"/tmp/source-{uuid.uuid4()}.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        tar.add(temp_dir, arcname=".")
+
+    # Upload to GCS
+    storage_client = storage.Client(project=project_id)
+    try:
+        bucket = storage_client.get_bucket(bucket_name)
+    except Exception:
+        bucket = storage_client.create_bucket(bucket_name, location="us-central1")
+
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(tar_path)
+    logger.info(f"Source uploaded to gs://{bucket_name}/{blob_name}")
+
+    # Trigger Cloud Build
+    build_client = cloudbuild.CloudBuildClient()
+    build = cloudbuild.Build(
+        source=cloudbuild.Source(
+            storage_source=cloudbuild.StorageSource(
+                bucket=bucket_name,
+                object_=blob_name
+            )
+        ),
+        steps=[
+            cloudbuild.BuildStep(
+                name="gcr.io/cloud-builders/docker",
+                args=["build", "-t", image_uri, "."]
+            )
+        ],
+        images=[image_uri]
+    )
+
+    operation = build_client.create_build(project_id=project_id, build=build)
+    logger.info("Cloud Build triggered, waiting for completion...")
+    result = operation.result(timeout=300)
+
+    if result.status != cloudbuild.Build.Status.SUCCESS:
+        raise Exception(f"Cloud Build failed with status: {result.status}")
+
+    logger.info(f"Image built and pushed: {image_uri}")
+
+    # Cleanup
+    os.remove(tar_path)
+    blob.delete()
+
+    return image_uri
+
+
+def build_and_push_image(temp_dir: str, image_tag: str, project_id: str) -> str:
+    """
+    Builds and pushes sandbox image.
+    Uses local Docker on Windows, Cloud Build API on Linux/Cloud Run.
+    """
+    if IS_WINDOWS:
+        return _build_with_docker(temp_dir, image_tag, project_id)
+    else:
+        return _build_with_cloud_build(temp_dir, image_tag, project_id)
+
+
+def _deploy_with_gcloud(image_uri: str, service_name: str, project_id: str) -> str:
+    """
+    Deploys sandbox to Cloud Run using gcloud CLI.
+    Used on Windows/local development.
     """
     logger.info(f"Deploying sandbox to Cloud Run: {service_name}")
 
@@ -126,6 +200,93 @@ def deploy_to_cloud_run(image_uri: str, service_name: str, project_id: str) -> s
             return url
 
     raise Exception("Could not extract Cloud Run URL from deployment output")
+
+
+def _deploy_with_api(image_uri: str, service_name: str, project_id: str) -> str:
+    """
+    Deploys sandbox to Cloud Run using Python client library.
+    Used on Cloud Run — no gcloud CLI needed.
+    """
+    from google.cloud import run_v2
+    from google.iam.v1 import iam_policy_pb2, policy_pb2
+
+    logger.info(f"Deploying sandbox to Cloud Run: {service_name}")
+
+    region = os.getenv("CLOUD_RUN_REGION", "us-central1")
+    client = run_v2.ServicesClient()
+    parent = f"projects/{project_id}/locations/{region}"
+    service_path = f"{parent}/services/{service_name}"
+
+    service = run_v2.Service(
+        template=run_v2.RevisionTemplate(
+            containers=[
+                run_v2.Container(
+                    image=image_uri,
+                    ports=[run_v2.ContainerPort(container_port=8080)],
+                    resources=run_v2.ResourceRequirements(
+                        limits={"memory": "512Mi", "cpu": "1"}
+                    )
+                )
+            ],
+            scaling=run_v2.RevisionScaling(
+                min_instance_count=0,
+                max_instance_count=1
+            )
+        )
+    )
+
+    try:
+        # Update existing service if it exists
+        existing = client.get_service(name=service_path)
+        service.name = service_path
+        service.etag = existing.etag
+        operation = client.update_service(service=service)
+        logger.info("Updating existing sandbox service...")
+    except Exception:
+        # Create new service — name must NOT be set on create
+        service.name = ""
+        operation = client.create_service(
+            parent=parent,
+            service=service,
+            service_id=service_name
+        )
+        logger.info("Creating new sandbox service...")
+
+    result = operation.result(timeout=300)
+    url = result.uri
+
+    # Allow unauthenticated access to sandbox
+    try:
+        iam_client = run_v2.ServicesClient()
+        iam_client.set_iam_policy(
+            request=iam_policy_pb2.SetIamPolicyRequest(
+                resource=service_path,
+                policy=policy_pb2.Policy(
+                    bindings=[
+                        policy_pb2.Binding(
+                            role="roles/run.invoker",
+                            members=["allUsers"]
+                        )
+                    ]
+                )
+            )
+        )
+    except Exception as e:
+        logger.warning(f"Could not set IAM policy: {e}")
+
+    logger.info(f"Sandbox live at: {url}")
+    return url
+
+
+def deploy_to_cloud_run(image_uri: str, service_name: str, project_id: str) -> str:
+    """
+    Deploys sandbox to Cloud Run.
+    Uses gcloud CLI on Windows, Python API on Linux/Cloud Run.
+    """
+    if IS_WINDOWS:
+        return _deploy_with_gcloud(image_uri, service_name, project_id)
+    else:
+        return _deploy_with_api(image_uri, service_name, project_id)
 
 
 def deploy_sandbox(finding, project_id: str, mr_iid: str) -> str:
