@@ -6,13 +6,12 @@ from google.genai import types
 from pydantic import BaseModel, Field
 from typing import List
 from dotenv import load_dotenv
+from agent.logger import get_logger
+from agent.secrets import get_secret
 
 load_dotenv()
 
 logger = get_logger("analyzer")
-
-from agent.logger import get_logger
-from agent.secrets import get_secret
 
 # Structured data models for Gemini's security analysis output.
 # Pydantic enforces the schema at the engine level, no manual JSON parsing needed.
