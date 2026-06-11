@@ -3,6 +3,9 @@ import requests
 from google import genai
 from google.genai import types
 from agent.sandbox import deploy_sandbox
+from agent.logger import get_logger
+
+logger = get_logger("attacker")
 
 # Response signals that confirm a successful attack in the sandbox response body.
 # Both body content and HTTP status are checked — see run_attack for full logic.
@@ -31,7 +34,6 @@ def run_attack(sandbox_url: str, finding) -> dict:
     """
     target_url = f"{sandbox_url}/test"
 
-    # Inject payload into the specific field Gemini flagged as vulnerable
     post_data = {
         finding.attack_field: finding.attack_payload,
         "password": "anything"
@@ -49,7 +51,7 @@ def run_attack(sandbox_url: str, finding) -> dict:
         body_failure = any(signal in response.text.lower() for signal in ATTACK_FAILURE_SIGNALS)
         attack_succeeded = body_match or (response.status_code == 200 and not body_failure)
 
-        print(f"Attack result, succeeded: {attack_succeeded}, status: {response.status_code}")
+        logger.info(f"Attack result, succeeded: {attack_succeeded}, status: {response.status_code}")
 
         return {
             "status_code": response.status_code,
@@ -60,7 +62,7 @@ def run_attack(sandbox_url: str, finding) -> dict:
         }
 
     except Exception as e:
-        print(f"Attack request failed: {e}")
+        logger.error(f"Attack request failed: {e}")
         return {
             "status_code": None,
             "response_body": str(e),
@@ -76,8 +78,6 @@ def deploy_fix_and_verify(finding, gcp_project_id: str, mr_iid: str) -> dict:
     Uses fixed_sandbox_template for dynamic fix verification if available.
     Returns after proof dict, same structure as run_attack output.
     """
-    # Wrap fixed_code in a minimal object so deploy_sandbox can use it.
-    # deploy_sandbox expects a finding-like object with a vulnerable_code field.
     class FixedFinding:
         vulnerable_code = finding.fixed_code
         attack_payload = finding.attack_payload
@@ -85,16 +85,16 @@ def deploy_fix_and_verify(finding, gcp_project_id: str, mr_iid: str) -> dict:
         vulnerability = finding.vulnerability
         sandbox_template = getattr(finding, 'fixed_sandbox_template', None)
 
-    print("Deploying fixed code to sandbox...")
+    logger.info("Deploying fixed code to sandbox...")
     fixed_sandbox_url = deploy_sandbox(FixedFinding(), gcp_project_id, mr_iid)
 
-    print("Running attack against fixed sandbox...")
+    logger.info("Running attack against fixed sandbox...")
     after_proof = run_attack(fixed_sandbox_url, finding)
 
     if not after_proof["attack_succeeded"]:
-        print("Fix verified, attack blocked successfully")
+        logger.info("Fix verified, attack blocked successfully")
     else:
-        print("Fix did not block attack, retry needed")
+        logger.warning("Fix did not block attack, retry needed")
 
     return after_proof
 
@@ -130,9 +130,8 @@ def get_improved_fix(finding, failed_proof: dict):
         )
 
         improved_code = response.text.strip()
-        print(f"Improved fix from Gemini: {improved_code}")
+        logger.info(f"Improved fix from Gemini: {improved_code}")
 
-        # Wrap improved code in a finding-like object for deploy_sandbox compatibility
         class ImprovedFinding:
             vulnerable_code = improved_code
             fixed_code = improved_code
@@ -143,7 +142,7 @@ def get_improved_fix(finding, failed_proof: dict):
         return ImprovedFinding()
 
     except Exception as e:
-        print(f"Failed to get improved fix from Gemini: {e}")
+        logger.error(f"Failed to get improved fix from Gemini: {e}")
         return None
 
 
@@ -158,16 +157,15 @@ def iterative_fix_loop(finding, before_proof: dict, gcp_project_id: str, mr_iid:
     after_proof = None
 
     for attempt in range(1, MAX_RETRIES + 1):
-        print(f"Fix attempt {attempt} of {MAX_RETRIES}...")
+        logger.info(f"Fix attempt {attempt} of {MAX_RETRIES}...")
 
         after_proof = deploy_fix_and_verify(current_finding, gcp_project_id, mr_iid)
 
         if not after_proof["attack_succeeded"]:
-            print(f"Fix verified on attempt {attempt}")
+            logger.info(f"Fix verified on attempt {attempt}")
             return after_proof, attempt, False
 
-        # Fix didn't work, request improved fix from Gemini with failure context
-        print(f"Attempt {attempt} failed, requesting improved fix from Gemini...")
+        logger.warning(f"Attempt {attempt} failed, requesting improved fix from Gemini...")
         improved_finding = get_improved_fix(current_finding, after_proof)
 
         if improved_finding is None:
@@ -175,5 +173,5 @@ def iterative_fix_loop(finding, before_proof: dict, gcp_project_id: str, mr_iid:
 
         current_finding = improved_finding
 
-    print(f"All {MAX_RETRIES} attempts exhausted, flagging for manual review")
+    logger.warning(f"All {MAX_RETRIES} attempts exhausted, flagging for manual review")
     return after_proof, MAX_RETRIES, True

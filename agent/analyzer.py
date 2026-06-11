@@ -6,6 +6,9 @@ from google.genai import types
 from pydantic import BaseModel, Field
 from typing import List
 from dotenv import load_dotenv
+from agent.logger import get_logger
+logger = get_logger("analyzer")
+from agent.secrets import get_secret
 
 load_dotenv()
 
@@ -129,6 +132,10 @@ def build_gemini_prompt(file_contents: dict) -> str:
         "- sandbox_template: Generate a complete working Flask app that accurately demonstrates this specific vulnerability\n"
         "- Create a database table that matches the context of the vulnerable code "
         "(users table for auth, products table for search, etc.)\n"
+        "- Use ONLY sqlite3.connect(':memory:') for the database — do NOT use file paths or URI formats\n"
+        "- Initialize the database inside the /test endpoint, not in a separate init_db() function\n"
+        "- Each request must create its own in-memory database with test data inserted fresh\n"
+        "- Cloud Run containers have a read-only filesystem — file-based databases will cause deployment failure\n"
         "- The /test endpoint must use request.form.get() to read POST fields\n"
         "- Use the same field name as attack_field in the /test endpoint\n"
         "- The app must return exactly {\"status\": \"success\", \"message\": \"Welcome admin\"} when attack succeeds\n"
@@ -157,8 +164,8 @@ def call_gemini(prompt: str) -> SecurityReport:
     """
     client = genai.Client(
         vertexai=True,
-        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
-        location=os.getenv("GOOGLE_CLOUD_LOCATION")
+        project=get_secret("GOOGLE_CLOUD_PROJECT") if os.getenv("GOOGLE_CLOUD_PROJECT") else os.getenv("GOOGLE_CLOUD_PROJECT"),
+        location=get_secret("GOOGLE_CLOUD_LOCATION"),
     )
 
     response = client.models.generate_content(
@@ -233,6 +240,6 @@ def detect_prompt_injection(file_contents: dict) -> tuple:
     for filename, code in file_contents.items():
         for pattern in PROMPT_INJECTION_PATTERNS:
             if pattern.lower() in code.lower():
-                print(f"Prompt injection attempt detected in {filename}, pattern: {pattern}")
+                logger.warning(f"Prompt injection attempt detected in {filename}, pattern: {pattern}")
                 return True, filename, pattern
     return False, None, None

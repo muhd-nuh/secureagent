@@ -5,8 +5,12 @@ import subprocess
 import time
 import platform
 from dotenv import load_dotenv
+from agent.logger import get_logger
+from agent.secrets import get_secret
 
 load_dotenv()
+
+logger = get_logger("sandbox")
 
 # Use .cmd extension on Windows, gcloud is a shell script on Linux/Mac
 GCLOUD_CMD = "gcloud.cmd" if platform.system() == "Windows" else "gcloud"
@@ -35,7 +39,7 @@ def inject_vulnerable_code(vulnerable_code: str, sandbox_template: str = None, a
             )
         with open(os.path.join(temp_dir, 'vulnerable_app.py'), 'w') as f:
             f.write(sandbox_template)
-        print(f"Gemini-generated sandbox template written to: {temp_dir}")
+        logger.info(f"Gemini-generated sandbox template written to: {temp_dir}")
     else:
         # Static fallback, injects the single vulnerable line into the harness template
         template_path = os.path.join(templates_dir, 'vulnerable_app.py')
@@ -50,7 +54,7 @@ def inject_vulnerable_code(vulnerable_code: str, sandbox_template: str = None, a
 
         with open(os.path.join(temp_dir, 'vulnerable_app.py'), 'w') as f:
             f.write(injected_content)
-        print(f"Static template with injected code written to: {temp_dir}")
+        logger.info(f"Static template with injected code written to: {temp_dir}")
 
     return temp_dir
 
@@ -62,7 +66,7 @@ def build_and_push_image(temp_dir: str, image_tag: str, project_id: str) -> str:
     """
     image_uri = f"gcr.io/{project_id}/secureagent-sandbox:{image_tag}"
 
-    print(f"Building Docker image: {image_uri}")
+    logger.info(f"Building Docker image: {image_uri}")
     build_result = subprocess.run(
         ["docker", "build", "-t", image_uri, temp_dir],
         capture_output=True,
@@ -72,9 +76,9 @@ def build_and_push_image(temp_dir: str, image_tag: str, project_id: str) -> str:
     if build_result.returncode != 0:
         raise Exception(f"Docker build failed: {build_result.stderr}")
 
-    print("Docker image built successfully")
+    logger.info("Docker image built successfully")
 
-    print("Pushing image to GCR...")
+    logger.info("Pushing image to GCR...")
     push_result = subprocess.run(
         ["docker", "push", image_uri],
         capture_output=True,
@@ -84,7 +88,7 @@ def build_and_push_image(temp_dir: str, image_tag: str, project_id: str) -> str:
     if push_result.returncode != 0:
         raise Exception(f"Docker push failed: {push_result.stderr}")
 
-    print(f"Image pushed: {image_uri}")
+    logger.info(f"Image pushed: {image_uri}")
     return image_uri
 
 
@@ -95,14 +99,14 @@ def deploy_to_cloud_run(image_uri: str, service_name: str, project_id: str) -> s
     gcloud outputs the service URL to stderr, not stdout, so we parse stderr.
     Returns the live sandbox URL.
     """
-    print(f"Deploying sandbox to Cloud Run: {service_name}")
+    logger.info(f"Deploying sandbox to Cloud Run: {service_name}")
 
     deploy_result = subprocess.run(
         [
             GCLOUD_CMD, "run", "deploy", service_name,
             "--image", image_uri,
             "--platform", "managed",
-            "--region", os.getenv("CLOUD_RUN_REGION", "us-central1"),
+            "--region", get_secret("CLOUD_RUN_REGION") or "us-central1",
             "--allow-unauthenticated",
             "--port", "8080",
             "--project", project_id,
@@ -118,7 +122,7 @@ def deploy_to_cloud_run(image_uri: str, service_name: str, project_id: str) -> s
     for line in deploy_result.stderr.split("\n"):
         if "https://" in line and "Service URL:" in line:
             url = line.strip().split("Service URL: ")[-1]
-            print(f"Sandbox live at: {url}")
+            logger.info(f"Sandbox live at: {url}")
             return url
 
     raise Exception("Could not extract Cloud Run URL from deployment output")
@@ -147,7 +151,7 @@ def deploy_sandbox(finding, project_id: str, mr_iid: str) -> str:
         sandbox_url = deploy_to_cloud_run(image_uri, service_name, project_id)
 
         # Brief wait to ensure the service is fully ready before attacks begin
-        print("Waiting for sandbox to warm up...")
+        logger.info("Waiting for sandbox to warm up...")
         time.sleep(10)
 
         return sandbox_url
